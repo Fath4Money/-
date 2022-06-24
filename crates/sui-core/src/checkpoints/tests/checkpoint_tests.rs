@@ -334,16 +334,14 @@ fn latest_proposal() {
     // No checkpoint no proposal
 
     let request = CheckpointRequest::latest(false);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(response.detail.is_none());
     assert!(matches!(
         response.info,
         AuthorityCheckpointInfo::Proposal { .. }
     ));
     if let AuthorityCheckpointInfo::Proposal { current, previous } = response.info {
-        assert!(current.is_some()); // Asking for a proposal creates one
+        assert!(current.is_none());
         assert!(matches!(previous, AuthenticatedCheckpoint::None));
     }
 
@@ -359,9 +357,7 @@ fn latest_proposal() {
 
     // Check the latest checkpoint with no detail
     let request = CheckpointRequest::latest(false);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(response.detail.is_none());
     assert!(matches!(
         response.info,
@@ -380,9 +376,7 @@ fn latest_proposal() {
 
     // Check the latest checkpoint with detail
     let request = CheckpointRequest::latest(true);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(response.detail.is_some());
     assert!(matches!(
         response.info,
@@ -445,9 +439,7 @@ fn latest_proposal() {
     assert!(cps1.set_proposal(committee.epoch).is_err());
 
     let request = CheckpointRequest::latest(false);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(response.detail.is_none());
     assert!(matches!(
         response.info,
@@ -462,9 +454,7 @@ fn latest_proposal() {
 
     // When details are needed, then return unexecuted transactions if there is no proposal
     let request = CheckpointRequest::latest(true);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(response.detail.is_none());
 
     assert!(matches!(
@@ -485,9 +475,7 @@ fn latest_proposal() {
 
     // Get the full proposal with previous proposal
     let request = CheckpointRequest::latest(true);
-    let response = cps1
-        .handle_latest_proposal(committee.epoch, &request)
-        .expect("no errors");
+    let response = cps1.handle_latest_proposal(&request).expect("no errors");
     assert!(matches!(
         response.info,
         AuthorityCheckpointInfo::Proposal { .. }
@@ -619,7 +607,7 @@ fn set_get_checkpoint() {
 
     // Send the certificate to a party that has the data
     let response_ckp = cps1
-        .handle_checkpoint_certificate(&checkpoint_cert, &None, &committee)
+        .process_checkpoint_certificate(&checkpoint_cert, &None, &committee)
         .unwrap();
     assert!(matches!(
         response_ckp.info,
@@ -636,11 +624,11 @@ fn set_get_checkpoint() {
     // --- TEST 3 ---
 
     // Setting just cert to a node that does not have the checkpoint fails
-    let response_ckp = cps4.handle_checkpoint_certificate(&checkpoint_cert, &None, &committee);
+    let response_ckp = cps4.process_checkpoint_certificate(&checkpoint_cert, &None, &committee);
     assert!(response_ckp.is_err());
 
     // Setting with contents succeeds BUT has not processed transactions
-    let response_ckp = cps4.handle_checkpoint_certificate(
+    let response_ckp = cps4.process_checkpoint_certificate(
         &checkpoint_cert,
         &Some(transactions.clone()),
         &committee,
@@ -650,7 +638,7 @@ fn set_get_checkpoint() {
     // Process transactions and then ask for checkpoint.
     cps4.handle_internal_batch(0, &batch, &committee).unwrap();
     let response_ckp = cps4
-        .handle_checkpoint_certificate(&checkpoint_cert, &Some(transactions), &committee)
+        .process_checkpoint_certificate(&checkpoint_cert, &Some(transactions), &committee)
         .unwrap();
     assert!(matches!(
         response_ckp.info,
@@ -1047,15 +1035,15 @@ fn set_fragment_external() {
 
     // When the fragment concern the authority it processes it
     assert!(cps1
-        .handle_receive_fragment(&fragment12, &committee)
+        .submit_local_fragment_to_consensus(&fragment12, &committee)
         .is_ok());
     assert!(cps2
-        .handle_receive_fragment(&fragment12, &committee)
+        .submit_local_fragment_to_consensus(&fragment12, &committee)
         .is_ok());
 
     // When the fragment does not concern the authority it does not process it.
     assert!(cps3
-        .handle_receive_fragment(&fragment12, &committee)
+        .submit_local_fragment_to_consensus(&fragment12, &committee)
         .is_err());
 }
 
@@ -1252,7 +1240,7 @@ fn test_fragment_full_flow() {
     // Validator 3 is not validator 5 or 6
     assert!(test_objects[3]
         .1
-        .handle_receive_fragment(&fragment_xy, &committee)
+        .submit_local_fragment_to_consensus(&fragment_xy, &committee)
         .is_err());
     // Nothing is sent to consensus
     assert!(rx.try_recv().is_err());
@@ -1260,11 +1248,11 @@ fn test_fragment_full_flow() {
     // But accept it on both the 5 and 6
     assert!(test_objects[5]
         .1
-        .handle_receive_fragment(&fragment_xy, &committee)
+        .submit_local_fragment_to_consensus(&fragment_xy, &committee)
         .is_ok());
     assert!(test_objects[6]
         .1
-        .handle_receive_fragment(&fragment_xy, &committee)
+        .submit_local_fragment_to_consensus(&fragment_xy, &committee)
         .is_ok());
 
     // Check we registered one local fragment
@@ -1278,7 +1266,7 @@ fn test_fragment_full_flow() {
             let fragment_xy = proposal.fragment_with(&proposals[proposals.len() - 1]);
             assert!(test_objects[proposals.len() - 1]
                 .1
-                .handle_receive_fragment(&fragment_xy, &committee)
+                .submit_local_fragment_to_consensus(&fragment_xy, &committee)
                 .is_ok());
             fragments.push(fragment_xy);
         }
@@ -1288,7 +1276,7 @@ fn test_fragment_full_flow() {
         }
     }
 
-    // TEST 2 -- submit to all validators leads to reconstruction
+    // TEST 2 -- submit fragments to all validators, and construct checkpoint.
 
     let mut seq = ExecutionIndices::default();
     let cps0 = &mut test_objects[0].1;
@@ -1303,6 +1291,7 @@ fn test_fragment_full_flow() {
                 &PendCertificateForExecutionNoop
             )
             .is_ok());
+        cps0.attempt_to_construct_checkpoint(&committee).unwrap();
         seq.next(
             /* total_batches */ 100, /* total_transactions */ 100,
         );
@@ -1410,6 +1399,15 @@ pub struct TestSetup {
     pub authorities: Vec<TestAuthority>,
     pub transactions: Vec<sui_types::messages::Transaction>,
     pub aggregator: AuthorityAggregator<LocalAuthorityClient>,
+}
+
+impl TestSetup {
+    pub fn get_authority(&self, name: &AuthorityName) -> &TestAuthority {
+        self.authorities
+            .iter()
+            .find(|t| &t.authority.name == name)
+            .unwrap()
+    }
 }
 
 // TODO use the file name as a seed
@@ -1619,6 +1617,14 @@ async fn checkpoint_messaging_flow() {
 
     // Step 1 -- get a bunch of proposals
     let mut proposals = Vec::new();
+    // First make sure each authority creates a proposal.
+    for auth in &setup.authorities {
+        auth.checkpoint
+            .lock()
+            .new_proposal(setup.committee.epoch)
+            .unwrap();
+    }
+
     for (auth, client) in &setup.aggregator.authority_clients {
         let response = client
             .handle_checkpoint(CheckpointRequest::latest(true))
@@ -1649,19 +1655,29 @@ async fn checkpoint_messaging_flow() {
         let p0 = proposal.fragment_with(&proposals[(i + 1) % proposal_len].1);
         let p1 = proposal.fragment_with(&proposals[(i + 3) % proposal_len].1);
 
-        let client = &setup.aggregator.authority_clients[auth];
-        client
-            .handle_checkpoint(CheckpointRequest::set_fragment(p0))
-            .await
-            .expect("ok");
-        client
-            .handle_checkpoint(CheckpointRequest::set_fragment(p1))
-            .await
-            .expect("ok");
+        let authority = setup.get_authority(auth);
+        authority
+            .checkpoint
+            .lock()
+            .submit_local_fragment_to_consensus(&p0, &setup.committee)
+            .unwrap();
+        authority
+            .checkpoint
+            .lock()
+            .submit_local_fragment_to_consensus(&p1, &setup.committee)
+            .unwrap();
     }
 
-    // Give time to the receiving task to process
+    // Give time to the receiving task to process (so that consensus can sequence fragments).
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Now make sure each authority makes some progress to create a checkpoint.
+    for auth in &setup.authorities {
+        auth.checkpoint
+            .lock()
+            .attempt_to_construct_checkpoint(&setup.committee)
+            .unwrap();
+    }
 
     // Note that some will be having a signed checkpoint and some will node
     // because they were not included in the first two links that make a checkpoint.
@@ -1697,15 +1713,21 @@ async fn checkpoint_messaging_flow() {
             .expect("all ok");
 
     // Step 4 -- Upload the certificate back up.
-    for (auth, client) in &setup.aggregator.authority_clients {
-        let request = if failed_authorities.contains(auth) {
-            CheckpointRequest::set_checkpoint(checkpoint_cert.clone(), contents.clone())
-        } else {
-            // These validators already have the checkpoint
-            CheckpointRequest::set_checkpoint(checkpoint_cert.clone(), None)
-        };
+    for auth in &setup.authorities {
+        let response = auth
+            .checkpoint
+            .lock()
+            .process_checkpoint_certificate(
+                &checkpoint_cert,
+                if failed_authorities.contains(&auth.authority.name) {
+                    &contents
+                } else {
+                    &None
+                },
+                &setup.committee,
+            )
+            .unwrap();
 
-        let response = client.handle_checkpoint(request).await.expect("No issues");
         assert!(matches!(response.info, AuthorityCheckpointInfo::Success));
     }
 }

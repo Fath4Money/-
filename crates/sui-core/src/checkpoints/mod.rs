@@ -289,14 +289,8 @@ impl CheckpointStore {
 
     pub fn handle_latest_proposal(
         &mut self,
-        epoch: EpochId,
         request: &CheckpointRequest,
     ) -> Result<CheckpointResponse, SuiError> {
-        // Set a proposal if there is not one, and one could be set
-        // TODO: check some minimum time passed since the last one
-        //       and only set after that time.
-        let _ = self.new_proposal(epoch);
-
         // Try to load any latest proposal
         let locals = self.get_locals();
         let latest_checkpoint_proposal = &locals.current_proposal;
@@ -475,12 +469,9 @@ impl CheckpointStore {
         Ok(())
     }
 
-    // TODO: this function should submit the received fragment to the
-    //       consensus algorithm for sequencing. It should also do some
-    //       basic checks to not submit redundant information to the
-    //       consensus, as well as to check it is the right node to
-    //       submit to consensus.
-    pub fn handle_receive_fragment(
+    // TODO: this function should do some basic checks to not submit redundant information to the
+    //       consensus, as well as to check it is the right node to submit to consensus.
+    pub fn submit_local_fragment_to_consensus(
         &mut self,
         fragment: &CheckpointFragment,
         committee: &Committee,
@@ -522,10 +513,6 @@ impl CheckpointStore {
             });
         }
 
-        // TODO: Checks here that the fragment makes progress over the existing
-        //       construction of components using the self.fragments table. This
-        //       is an optimization for later.
-
         let locals = self.get_locals();
         if !locals.no_more_fragments {
             // Send to consensus for sequencing.
@@ -533,18 +520,6 @@ impl CheckpointStore {
                 sender.send_to_consensus(fragment.clone())?;
             } else {
                 return Err(SuiError::from("No consensus sender configured"));
-            }
-        } else {
-            // Maybe the fragment we received allows us to complete the current checkpoint?
-            // Since we seem to be missing information to complete it (ie there is a checkpoint
-            // but we are not included in it.)
-            loop {
-                let construct = self.attempt_to_construct_checkpoint(committee);
-                // Exit if checkpoint construction leads to an error or returns false
-                // (ie no new checkpoint is created.)
-                if construct.is_err() || !construct.unwrap() {
-                    break;
-                }
             }
         }
 
@@ -563,28 +538,28 @@ impl CheckpointStore {
     /// fragments should be provided in seq increasing order.
     pub fn handle_internal_fragment<P: PendCertificateForExecution>(
         &mut self,
-        _seq: ExecutionIndices,
-        _fragment: CheckpointFragment,
+        seq: ExecutionIndices,
+        fragment: CheckpointFragment,
         committee: &Committee,
         handle_pending_cert: &P,
     ) -> Result<(), FragmentInternalError> {
         // Ensure we have not already processed this fragment.
         if let Some((last_seq, _)) = self.fragments.iter().skip_to_last().next() {
-            if _seq <= last_seq {
+            if seq <= last_seq {
                 // We have already processed this fragment, just exit.
                 return Ok(());
             }
         }
 
         // Check structure is correct and signatures verify
-        _fragment
+        fragment
             .verify(committee)
             .map_err(FragmentInternalError::Error)?;
 
         // Schedule for execution all the certificates that are included here.
         handle_pending_cert
             .pending_execution(
-                _fragment
+                fragment
                     .certs
                     .iter()
                     .map(|(digest, cert)| (digest.transaction, cert.clone()))
@@ -592,51 +567,46 @@ impl CheckpointStore {
             )
             .map_err(|_err| {
                 // There is a possibility this was not stored!
-                let fragment = _fragment.clone();
+                let fragment = fragment.clone();
                 FragmentInternalError::Retry(Box::new(fragment))
             })?;
 
         // Save the new fragment in the DB
-        self.fragments.insert(&_seq, &_fragment).map_err(|_err| {
+        self.fragments.insert(&seq, &fragment).map_err(|_err| {
             // There is a possibility this was not stored!
-            let fragment = _fragment.clone();
+            let fragment = fragment.clone();
             FragmentInternalError::Retry(Box::new(fragment))
         })?;
 
         // If the fragment contains us also save it in the list of local fragments
         let next_sequence_number = self.next_checkpoint();
-        if *_fragment.proposer.summary.sequence_number() == next_sequence_number {
-            if _fragment.proposer.authority() == &self.name {
+        if *fragment.proposer.summary.sequence_number() == next_sequence_number {
+            if fragment.proposer.authority() == &self.name {
                 self.local_fragments
-                    .insert(_fragment.other.authority(), &_fragment)
+                    .insert(fragment.other.authority(), &fragment)
                     .map_err(|_err| {
                         // There is a possibility this was not stored!
-                        let fragment = _fragment.clone();
+                        let fragment = fragment.clone();
                         FragmentInternalError::Retry(Box::new(fragment))
                     })?;
             }
-            if _fragment.other.authority() == &self.name {
+            if fragment.other.authority() == &self.name {
                 self.local_fragments
-                    .insert(_fragment.proposer.authority(), &_fragment)
+                    .insert(fragment.proposer.authority(), &fragment)
                     .map_err(|_err| {
                         // There is a possibility this was not stored!
-                        let fragment = _fragment.clone();
+                        let fragment = fragment.clone();
                         FragmentInternalError::Retry(Box::new(fragment))
                     })?;
             }
         }
 
-        // Attempt to move forward, as many times as we can
-        while self
-            .attempt_to_construct_checkpoint(committee)
-            .unwrap_or(false)
-        {}
         Ok(())
     }
 
     /// Attempt to construct the next expected checkpoint, and return true if a new
     /// checkpoint is created or false if it is not.
-    fn attempt_to_construct_checkpoint(
+    pub fn attempt_to_construct_checkpoint(
         &mut self,
         committee: &Committee,
     ) -> Result<bool, FragmentInternalError> {
@@ -783,14 +753,14 @@ impl CheckpointStore {
         Ok(None)
     }
 
-    /// Handles the submission of a full checkpoint externally, and stores
-    /// the certificate. It may be used to upload a certificate, or induce
-    /// the authority to catch up with the latest checkpoints.
+    /// Processes a checkpoint certificate that this validator just learned about.
+    /// Such certificate may either be created locally based on a quorum of signed checkpoints,
+    /// or downloaded from other validators to sync local checkpoint state.
     ///
     /// A cert without contents is only stored if we have already processed
     /// internally the checkpoint. A cert with contents is processed as if
     /// it came from the internal consensus.
-    pub fn handle_checkpoint_certificate(
+    pub fn process_checkpoint_certificate(
         &mut self,
         checkpoint: &CertifiedCheckpointSummary,
         contents: &Option<CheckpointContents>,
